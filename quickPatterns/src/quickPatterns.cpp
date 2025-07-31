@@ -1,0 +1,122 @@
+#include "quickPatterns.h"
+
+quickPatterns::quickPatterns(CRGB *leds, int numLeds) {
+  this->lightStrand = new qpLightStrand(leds, numLeds);
+}
+
+quickPatterns::~quickPatterns() {
+  delete this->lightStrand;
+}
+
+// Render
+
+bool quickPatterns::draw() {
+
+  uint32_t currentMillis = millis();
+
+  if(currentMillis >= this->nextTickMillis) {
+
+    this->nextTickMillis = (currentMillis + this->tickLengthInMillis);
+
+    this->lightStrand->clearMain();
+
+    this->currentScene->draw(this->lightStrand->getLeds(), this->lightStrand->getNumLeds());
+
+    return true;
+  }
+
+  return false;
+
+}
+
+
+// Quick add pattern
+
+qpPattern &quickPatterns::addPattern(qpPattern *pattern) {
+
+  return this->scene(0).newLayer().addPattern(pattern);
+}
+
+
+// Returns requested scene or automatically adds and returns a new scene if index does not yet exist
+qpScene &quickPatterns::scene(uint8_t index) {
+
+  if(index > (this->scenes.numElements - 1))
+    return this->newScene();
+
+  this->lastReferencedScene = this->scenes.getItem(index);
+
+  return *this->lastReferencedScene;
+}
+
+qpScene &quickPatterns::newScene() {
+
+  this->lastReferencedScene = this->scenes.append(new qpScene(this->lightStrand));
+
+  // if this is the first scene added, make it our current scene
+  if(this->scenes.numElements == 1)
+    this->currentScene = this->lastReferencedScene;
+
+  return *this->lastReferencedScene;
+}
+
+
+// ~ Access
+
+qpLayer &quickPatterns::layer(uint8_t layerIndex) {
+
+  return this->scene(0).layer(layerIndex);
+}
+
+
+// ~ Scene navigation
+
+void quickPatterns::nextScene() {
+  this->sceneIndex++;
+  if(this->sceneIndex >= this->scenes.numElements)
+    this->sceneIndex = 0;
+
+  this->playScene(this->sceneIndex);
+}
+
+
+void quickPatterns::playScene(uint8_t index) {
+
+  if(index >= this->scenes.numElements)
+    return;
+
+  this->lightStrand->clearAll();
+
+  this->sceneIndex = index;
+
+  this->currentScene = this->scenes.getItem(index);
+}
+
+
+void quickPatterns::playRandomScene() {
+
+  uint8_t index;
+  do {
+    index = random8(0, (this->scenes.numElements));
+  } while(index == this->sceneIndex);
+
+  this->playScene(index);
+}
+
+
+// Quick access operators
+
+qpPattern&quickPatterns::operator()(uint8_t layerIndex) {
+
+  return this->scene(0).layer(layerIndex).pattern(0);
+}
+
+qpPattern&quickPatterns::operator()(uint8_t sceneIndex, uint8_t layerIndex) {
+
+  return this->scene(sceneIndex).layer(layerIndex).pattern(0);
+}
+
+qpPattern&quickPatterns::operator()(uint8_t sceneIndex, uint8_t layerIndex, uint8_t patternIndex) {
+
+  return this->scene(sceneIndex).layer(layerIndex).pattern(patternIndex);
+}
