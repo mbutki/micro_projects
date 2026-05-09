@@ -4,16 +4,17 @@ import network
 from umqtt.robust import MQTTClient
 from secrets import WIFI_SSID, WIFI_PASSWORD, MQTT_BROKER, MQTT_CLIENT_ID, MQTT_TOPIC
 import ujson
-from sht31 import SHT31
+from sht41 import SHT4X
 import ntptime
 import ucollections
 
-LOCATION = "outside"
+LOCATION = "backyard"
+ERROR_TOPIC = "sensor/error"
 VERBOSE = False
 
 # I2C sensors
-i2c = machine.I2C(1, scl=machine.Pin(3), sda=machine.Pin(2))
-sht = SHT31(i2c=i2c, addr=0x44)
+i2c = machine.I2C(1, scl=machine.Pin(3), sda=machine.Pin(2), freq=10000) # Dropped to 10kHz for stability
+sht = SHT4X(i2c=i2c)
 
 # UART PMS5003 setup (pins and baudrate as your hardware)
 uart = machine.UART(0, baudrate=9600, tx=machine.Pin(0), rx=machine.Pin(1))
@@ -21,7 +22,7 @@ uart = machine.UART(0, baudrate=9600, tx=machine.Pin(0), rx=machine.Pin(1))
 # Sensor sample structure
 SensorSample = ucollections.namedtuple('SensorSample', 'temp humidity')
 
-SAMPLE_FREQ_HZ = 5           # sensor sample rate per second
+SAMPLE_FREQ_HZ = 3           # sensor sample rate per second
 PUBLISH_INTERVAL_SEC = 1     # publish every N seconds
 
 SAMPLES_PER_PUBLISH = SAMPLE_FREQ_HZ * PUBLISH_INTERVAL_SEC
@@ -29,6 +30,22 @@ SAMPLES_PER_PUBLISH = SAMPLE_FREQ_HZ * PUBLISH_INTERVAL_SEC
 samples = []
 latest_pm25_raw = None
 latest_pm25 = None
+
+client = None
+
+def log_error(error):
+    print(f'logged error: {error}')
+    payload = {
+        "timestamp": time.time(),
+        "location": LOCATION,
+        "error": error
+    }
+
+    try:
+        msg = ujson.dumps(payload)
+        client.publish(ERROR_TOPIC, msg)
+    except Exception as e:
+        print("MQTT publish failed:", e)
 
 def median(data):
     data = sorted(data)
@@ -102,9 +119,9 @@ def read_pms5003_async():
                             pm25_env = (frame[12] << 8) | frame[13]
                             return pm25_env
                         else:
-                            print("PMS5003 checksum fail")
+                            log_error("PMS5003 checksum fail")
                     else:
-                        print("PMS5003 invalid header")
+                        log_error("PMS5003 invalid header")
                     # Remove processed frame bytes
                     buffer = buffer[32:]
         else:
@@ -122,19 +139,62 @@ def connect_wifi():
 def sync_time():
     try:
         ntptime.settime()
-        print("Time synced from NTP")
+        if VERBOSE:
+            print("Time synced from NTP")
     except Exception as e:
-        print("Failed to sync time:", e)
+        log_error(f'Failed to sync time:{e}')
+
+def reinit_sht4x():
+    """Attempts to recover the I2C bus and re-initialize the SHT4X sensor."""
+    global i2c, sht
+    print("Attempting I2C bus recovery...")
+    try:
+        # 1. Manual Bus Clear: If a slave is holding SDA low, toggle SCL until it releases.
+        # We temporarily treat the pins as standard GPIOs.
+        scl_pin = machine.Pin(3, machine.Pin.OUT, machine.Pin.PULL_UP)
+        sda_pin = machine.Pin(2, machine.Pin.IN, machine.Pin.PULL_UP)
+        
+        # Clock SCL up to 9 times to clear the slave's internal state machine
+        for _ in range(9):
+            if sda_pin.value() == 1:
+                break
+            scl_pin.value(0)
+            time.sleep_us(5)
+            scl_pin.value(1)
+            time.sleep_us(5)
+
+        # 2. Re-initialize the I2C hardware bus at a lower frequency
+        i2c = machine.I2C(1, scl=machine.Pin(3), sda=machine.Pin(2), freq=10000)
+
+        # 3. Try a soft reset via I2C command if the sensor is responsive
+        try:
+            i2c.writeto(0x44, b'\x94')  # SHT4x soft reset
+            time.sleep_ms(10)
+        except:
+            pass
+        
+        # 4. Re-instantiate the sensor driver
+        sht = SHT4X(i2c=i2c)
+        time.sleep_ms(50) # Let it stabilize
+        return True
+    except Exception as e:
+        print(f"SHT4X re-init failed: {e}")
+        return False
 
 def main():
+    global client
+    global latest_pm25
+    global latest_pm25_raw
+    
     connect_wifi()
-    sync_time()
     client = MQTTClient(MQTT_CLIENT_ID, MQTT_BROKER)
     try:
         client.connect()
         print("Connected to MQTT broker")
     except Exception as e:
-        print("Failed to connect MQTT broker:", e)
+        log_error(f'Failed to connect MQTT broker:{e}')
+        
+    sync_time()
 
     last_ntp_sync = time.time()
     ntp_sync_interval = 3600
@@ -142,9 +202,9 @@ def main():
     next_sample_time = time.ticks_ms()
     sample_interval_ms = 1000 // SAMPLE_FREQ_HZ
     next_publish_time = time.ticks_add(next_sample_time, PUBLISH_INTERVAL_SEC * 1000)
-
-    global latest_pm25
-    global latest_pm25_raw
+    
+    consecutive_failures = 0
+    MAX_FAILURES = 5
 
     while True:
         now = time.time()
@@ -157,13 +217,33 @@ def main():
         if time.ticks_diff(current_ms, next_sample_time) >= 0:
             next_sample_time = time.ticks_add(next_sample_time, sample_interval_ms)
 
+            
             # Read all sensors except PMS5003
             try:
-                sht_temp_c, humidity = sht.get_temp_humi()
+                sht_temp_c, humidity = sht.measurements
+                if sht_temp_c is None or humidity is None:
+                    raise ValueError(f"Invalid SHT4X values: temp:{sht_temp_c} humid:{humidity}")
+                if not (-40 < sht_temp_c < 125):
+                    raise ValueError(f"Out-of-range SHT4X values: temp:{sht_temp_c}")
                 temp = sht_temp_c * 9 / 5 + 32
-            except:
+                consecutive_failures = 0 # Reset counter on success
+            except Exception as e:
+                consecutive_failures += 1
+                log_error(f'SHT4X Read error ({consecutive_failures}/{MAX_FAILURES}): {e}')
+                
+                # Short delay to let electrical noise settle
+                time.sleep_ms(200)
+                
+                if consecutive_failures >= MAX_FAILURES:
+                    log_error("Max failures reached. Resetting Pico...")
+                    time.sleep_ms(1000)
+                    machine.reset()
+                
+                # Attempt soft recovery
+                reinit_sht4x()
                 temp = None
                 humidity = None
+                time.sleep_ms(100) # Short breather before next attempt
 
             pm25_raw = read_pms5003_async()
             if pm25_raw is not None:
@@ -200,10 +280,11 @@ def main():
 
             try:
                 msg = ujson.dumps(payload)
-                print("Publishing:", msg)
+                if VERBOSE:
+                    print("Publishing:", msg)
                 client.publish(MQTT_TOPIC, msg)
             except Exception as e:
-                print("MQTT publish failed:", e)
+                log_error(f'MQTT publish failed:{e}')
 
             samples.clear()
 

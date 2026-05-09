@@ -49,6 +49,19 @@ class SHT31(object):
         """
         return self._i2c.readfrom(self._addr, count)
 
+    def _crc8(self, data):
+        # Polynomial 0x31, Init 0xFF
+        crc = 0xFF
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x80:
+                    crc = (crc << 1) ^ 0x31
+                else:
+                    crc <<= 1
+                crc &= 0xFF
+        return crc
+
     def _raw_temp_humi(self, r=R_HIGH, cs=True):
         """
         Read the raw temperature and humidity from the sensor and skips CRC
@@ -60,6 +73,11 @@ class SHT31(object):
         self._send(self._map_cs_r[cs][r])
         time.sleep_ms(50)
         raw = self._recv(6)
+        
+        # CRC check
+        if self._crc8(raw[0:2]) != raw[2] or self._crc8(raw[3:5]) != raw[5]:
+            return None, None
+
         return (raw[0] << 8) + raw[1], (raw[3] << 8) + raw[4]
 
     def get_temp_humi(self, resolution=R_HIGH, clock_stretch=True, celsius=True):
