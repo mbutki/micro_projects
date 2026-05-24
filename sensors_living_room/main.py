@@ -26,7 +26,7 @@ sht = SHT4X(i2c=i2c)
 uart = machine.UART(0, baudrate=9600, tx=machine.Pin(16), rx=machine.Pin(17))
 
 # Sensor sample structure
-SensorSample = ucollections.namedtuple('SensorSample', 'lux temp pressure humidity')
+SensorSample = ucollections.namedtuple('SensorSample', 'lux temp pressure humidity wifi')
 
 SAMPLE_FREQ_HZ = 3           # sensor sample rate per second
 PUBLISH_INTERVAL_SEC = 1     # publish every N seconds
@@ -137,6 +137,8 @@ def connect_wifi():
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
     wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    # Disable power management to improve stability
+    wlan.config(pm=0xa11140)
     while not wlan.isconnected():
         time.sleep(0.5)
     print("Connected to WiFi:", wlan.ifconfig())
@@ -155,16 +157,21 @@ def reinit_sht4x():
     print("Attempting I2C bus recovery...")
     try:
         # 1. Manual Bus Clear: If a slave is holding SDA low, toggle SCL until it releases.
+        # We temporarily treat the pins as standard GPIOs.
         scl_pin = machine.Pin(SCL, machine.Pin.OUT, machine.Pin.PULL_UP)
         sda_pin = machine.Pin(SDA, machine.Pin.IN, machine.Pin.PULL_UP)
         
-        for _ in range(9):
+        # Clock SCL up to 10 times to clear the slave's internal state machine (bus clear)
+        for _ in range(10):
             if sda_pin.value() == 1:
                 break
             scl_pin.value(0)
-            time.sleep_us(5)
+            time.sleep_us(20)
             scl_pin.value(1)
-            time.sleep_us(5)
+            time.sleep_us(20)
+
+        # Let the bus settle
+        time.sleep_ms(50)
 
         # 2. Re-initialize the I2C hardware bus at a lower frequency
         i2c = machine.I2C(1, scl=machine.Pin(SCL), sda=machine.Pin(SDA), freq=10000)
@@ -173,14 +180,18 @@ def reinit_sht4x():
         try:
             i2c.writeto(0x44, b'\x94')  # SHT4x soft reset
             time.sleep_ms(10)
-        except: pass
+        except:
+            pass
         
+        # 4. Re-instantiate the sensor driver
         sht = SHT4X(i2c=i2c)
         veml = VEML7700(i2c=i2c)
         bmp = BMP280(i2c, addr=0x77)
-        time.sleep_ms(50)
+        time.sleep_ms(50) # Let it stabilize
+        return True
     except Exception as e:
         print(f"I2C re-init failed: {e}")
+        return False
 
 def main():
     global client
@@ -205,7 +216,7 @@ def main():
     global latest_pm25
 
     consecutive_failures = 0
-    MAX_FAILURES = 5
+    MAX_FAILURES = 15 # Allow ~5 seconds of retries before resetting
 
     while True:
         now = time.time()
@@ -231,16 +242,18 @@ def main():
                 consecutive_failures += 1
                 log_error(f'SHT4X Read error ({consecutive_failures}/{MAX_FAILURES}): {e}')
                 
-                time.sleep_ms(200) # Let noise settle
+                time.sleep_ms(500) # Give transients more time to settle
                 
                 if consecutive_failures >= MAX_FAILURES:
                     log_error("Max failures reached. Resetting Pico...")
                     time.sleep_ms(1000)
                     machine.reset()
             
+                # Attempt soft recovery
                 reinit_sht4x()
                 temp = None
                 humidity = None
+                time.sleep_ms(100) # Short breather before next attempt
 
             try:
                 pressure = bmp.pressure
@@ -252,6 +265,11 @@ def main():
             except:
                 lux = None
 
+            try:
+                rssi = network.WLAN(network.STA_IF).status('rssi')
+            except:
+                rssi = None
+
             pm25_raw = read_pms5003_async()
             if pm25_raw is not None:
                 latest_pm25_raw = pm25_raw
@@ -262,7 +280,7 @@ def main():
                     
 
             # Append sample for median
-            samples.append(SensorSample(lux, temp, pressure, humidity))
+            samples.append(SensorSample(lux, temp, pressure, humidity, rssi))
             if len(samples) > SAMPLES_PER_PUBLISH:
                 samples.pop(0)
 
@@ -274,6 +292,7 @@ def main():
             median_temp = median([s.temp for s in samples if s.temp is not None])
             median_pressure = median([s.pressure for s in samples if s.pressure is not None])
             median_humidity = median([s.humidity for s in samples if s.humidity is not None])
+            median_wifi = median([s.wifi for s in samples if s.wifi is not None])
             aqi_raw = pm25_to_aqi(latest_pm25_raw) if latest_pm25_raw is not None else None
             aqi = pm25_to_aqi(latest_pm25) if latest_pm25 is not None else None
 
@@ -285,7 +304,8 @@ def main():
                 "pressure": median_pressure,
                 "humidity": median_humidity,
                 "aqi_raw": aqi_raw,
-                "aqi": aqi
+                "aqi": aqi,
+                "wifi": median_wifi
             }
 
             try:
@@ -294,7 +314,7 @@ def main():
                     print("Publishing:", msg)
                 client.publish(MQTT_TOPIC, msg)
             except Exception as e:
-                log_error('MQTT publish failed: {e}')
+                log_error(f'MQTT publish failed: {e}')
 
             samples.clear()
 
